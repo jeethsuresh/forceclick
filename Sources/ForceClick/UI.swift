@@ -132,6 +132,7 @@ struct SettingsView: View {
     @ObservedObject var store: Store
     @ObservedObject var triggers: TriggerCoordinator
     var openCommand: () -> Void = {}
+    var openInputDiagnostics: () -> Void = {}
     @StateObject private var ui = SettingsUI()
     var body: some View {
         TabView {
@@ -157,6 +158,7 @@ struct SettingsView: View {
                     Text("Pressure events observed: \(triggers.pressureEvents)")
                     Text("Force Click: hold the deeper click for more than 0.5 seconds.")
                     Text(triggers.pressureStatus).font(.caption).foregroundStyle(.secondary)
+                    Button("Input diagnostics & trackpad test…") { openInputDiagnostics() }
                     Text(triggers.suppression.status).font(.caption)
                     Text("Accessibility: \(ui.accessibilityGranted ? "Granted" : "Not granted — selected text cannot be read")")
                     Button("Enable Accessibility…") {
@@ -196,6 +198,46 @@ struct SettingsView: View {
                 Spacer(); Button("Save settings") { store.persist(); if store.persistenceError == nil { ui.status = "Saved." } }
             }.padding()
         }
+    }
+}
+
+// A view configured before mouse-down gives macOS an explicit local deep-click
+// target. Comparing this with the session stream separates hardware/Trackpad
+// configuration problems from cross-app monitor delivery problems.
+struct PressureTestPad: NSViewRepresentable {
+    final class Pad: NSView {
+        override init(frame: NSRect) {
+            super.init(frame: frame)
+            pressureConfiguration = NSPressureConfiguration(pressureBehavior: .primaryDeepClick)
+        }
+        required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+        override func mouseDown(with event: NSEvent) {}
+        override func pressureChange(with event: NSEvent) {}
+        override func draw(_ dirtyRect: NSRect) {
+            NSColor.controlBackgroundColor.setFill(); bounds.fill()
+            let instructions = "Force-click and hold here to test pressure inside ForceClick.\nThis test area records stages without opening the command panel."
+            (instructions as NSString).draw(in: bounds.insetBy(dx: 14, dy: 14), withAttributes: [
+                .font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.labelColor
+            ])
+        }
+    }
+    func makeNSView(context: Context) -> Pad { Pad(frame: .zero) }
+    func updateNSView(_ nsView: Pad, context: Context) {}
+}
+struct PressureDiagnosticsView: View {
+    @ObservedObject var diagnostics: PressureDiagnostics
+    var restart: () -> Void
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Input diagnostics").font(.headline)
+            Text("Try an ordinary click, then a deep hold in another app. Quartz counts test the session tap; AppKit global counts test the previous monitor. Use the area below to check local hardware pressure.").font(.callout)
+            ScrollView { Text(diagnostics.report).font(.system(.caption, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
+            PressureTestPad().frame(height: 78).clipShape(RoundedRectangle(cornerRadius: 8))
+            HStack {
+                Button("Restart input monitors") { restart() }
+                Button("Show report file") { NSWorkspace.shared.activateFileViewerSelecting([diagnostics.url]) }
+            }
+        }.padding(20).frame(width: 690, height: 480)
     }
 }
 

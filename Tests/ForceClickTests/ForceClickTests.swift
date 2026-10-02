@@ -14,6 +14,7 @@ func XCTAssertThrowsError<T>(_ expression: @autoclosure () throws -> T) { do { _
 @main struct PortableTests {
     @MainActor static func main() async throws {
         let t = ForceClickTests()
+        t.testPressureTapDoesNotSubscribeToKeys(); try t.testQuartzOrdinaryClicksStayOrdinary()
         t.testPressureOncePerGesture(); t.testDeepHoldMustBeContinuous(); t.testReleaseAndStalePressureCannotFire()
         await t.testHoldTimerWorksWithoutFurtherPressureSamples(); await t.testHoldTimerRejectsReleaseFocusChangeAndDisabledSetting()
         try t.testRejectUnsafeOrMalformedCalls(); t.testAllToolsHaveSchemas()
@@ -30,6 +31,24 @@ func XCTAssertThrowsError<T>(_ expression: @autoclosure () throws -> T) { do { _
 #endif
 
 final class ForceClickTests: XCTestCase {
+    @MainActor func testPressureTapDoesNotSubscribeToKeys() {
+        let mask = PressureEventTap.eventMask
+        for type in [CGEventType.keyDown, .keyUp, .flagsChanged] {
+            XCTAssertEqual(mask & (CGEventMask(1) << type.rawValue), 0)
+        }
+        XCTAssertTrue(mask & (CGEventMask(1) << CGEventType.leftMouseDown.rawValue) != 0)
+        XCTAssertTrue(mask & NSEvent.EventTypeMask.pressure.rawValue != 0)
+        XCTAssertTrue(mask & NSEvent.EventTypeMask.gesture.rawValue != 0)
+    }
+    func testQuartzOrdinaryClicksStayOrdinary() throws {
+        for type in [CGEventType.leftMouseDown, .leftMouseUp, .leftMouseDragged] {
+            let raw = try XCTUnwrap(CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: .zero, mouseButton: .left))
+            // Binary 1.0 mouse pressure must never be interpreted as stage 2.
+            raw.setDoubleValueField(.mouseEventPressure, value: 1)
+            let event = try XCTUnwrap(NSEvent(cgEvent: raw))
+            XCTAssertFalse(event.type == .pressure)
+        }
+    }
     func call(_ name: String, _ arguments: String) -> ToolCall { .init(function: .init(name: name, arguments: arguments)) }
     func testPressureOncePerGesture() {
         var gate = PressureGate()

@@ -24,15 +24,17 @@ Notes and todos are available in **Notes & todos**. Sticky notes can be edited a
 
 ## Force Touch and native Look Up
 
-`TriggerCoordinator` observes pressure in other apps. `PressureGate` requires stage 1 followed by a continuous stage-2 deep press held for **more than 0.5 seconds**. Ordinary clicks, long ordinary holds, and shorter deep presses do nothing. Releasing the click or relaxing back to stage 1 cancels the pending hold; pressing deeply again starts a fresh 0.5-second wait. A timer fires even when steady pressure produces no further samples, checks the physical left-button state and source-app focus, and opens the panel only once per held click. Settings shows the pressure-event count and current hold status.
+`TriggerCoordinator` observes pressure through a listen-only Core Graphics session event tap. It converts each received event with public `NSEvent(cgEvent:)` and acts only on actual `.pressure` stages, never on a normal mouse event's numeric pressure. Gesture carriers are included without assuming Quartz and AppKit event type numbers match. Keyboard and modifier events are excluded. The callback returns the original event unchanged, runs on the main run loop, and performs no file I/O. System-disabled taps are re-enabled and cancel pending holds.
 
-Global pressure delivery is **experimental and not guaranteed by AppKit across apps/macOS releases**. Test on a Force Touch trackpad in the source app. If capture fails after an accepted hold, the panel shows the actual error and a link to the capture report.
+`PressureGate` requires stage 1 followed by a continuous stage-2 deep press held for **more than 0.5 seconds**. Ordinary clicks, long ordinary holds, and shorter deep presses do nothing. Releasing the click or relaxing back to stage 1 cancels the pending hold; pressing deeply again starts a fresh 0.5-second wait. A timer fires even when steady pressure produces no further samples, checks the physical left-button state and source-app focus, and opens the panel only once per held click. Settings shows the pressure-event count and current hold status.
+
+The former AppKit global-monitor-only source received ordinary clicks but no pressure during the observed hardware test. On this Mac, the session tap receives Quartz type 29 events that AppKit converts to pressure type 34. Do not substitute a guessed Quartz type 34 mask. Cross-app delivery still depends on macOS and the target app's pressure configuration. If capture fails after an accepted hold, the panel shows the actual error and a link to the capture report.
 
 The keyboard fallback is Control–Option–Space, registered through Carbon's public hot-key API. Registration failure appears in Settings; the menu item remains available. Both the shortcut and a detected deep press read the highlighted text from the originating app and place it in the panel's selected-text box. Triggering again after selecting different text refreshes that box, even while the panel is already visible. Accessibility permission is required for cross-app capture. Input monitors refresh automatically when the grant changes. Reopening the app from Finder shows Settings; its Open command panel button captures from the last active external app.
 
 `LookUpSuppression` is a separate replaceable interface. Its shipped `PassiveLookUpSuppression` implementation is intentionally a no-op: public global monitors cannot cancel other apps' events, and there is no verified cross-app pressure suppression mechanism here. Native Look Up may appear too. No private event constants, SIP changes, injection, or system preference changes are used. This limitation does not block the rest of the app.
 
-Apple references: [pressure stage](https://developer.apple.com/documentation/appkit/nsevent/stage), [event monitor limitations](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/EventOverview/MonitoringEvents/MonitoringEvents.html).
+Apple references: [pressure stage](https://developer.apple.com/documentation/appkit/nsevent/stage), [global monitor](https://developer.apple.com/documentation/appkit/nsevent/addglobalmonitorforevents(matching:handler:)), [Core Graphics event tap](https://developer.apple.com/documentation/coregraphics/cgevent/tapcreate(tap:place:options:eventsofinterest:callback:userinfo:)), [NSEvent conversion](https://developer.apple.com/documentation/appkit/nsevent/init(cgevent:)-4igjn).
 
 ## Automations
 
@@ -95,3 +97,9 @@ To verify that a changed binary preserves the signing identity:
 ```
 
 This signs and verifies two different temporary executables and asserts that their code hashes differ while their certificate-bound designated requirements match. It does not change macOS privacy permissions.
+
+## Pressure troubleshooting
+
+Menu bar → **Input diagnostics & trackpad test…** (also in Settings) compares the session tap, old AppKit global monitor, and AppKit local monitor. The live report is saved to `~/Library/Application Support/ForceClick/pressure-diagnostics.txt`. It contains only event type counts, stage transitions, pressure values, monitor status and permission state; no keys, coordinates or selected text. Recent transitions are bounded and file writes are debounced off the event callback.
+
+Try a normal click, a short deep click, and a deep hold in another app. A working source shows `Quartz NSEvent 34` and stage 1 → 2 → 0 transitions. The local test area is explicitly configured for deep clicks and never opens the command panel; if it records pressure but the external app does not, investigate cross-app delivery/configuration. If even the local test area records no pressure, check the trackpad's Force Click setting and hardware. A failure to create the session tap is reported separately. **Restart input monitors** reinstalls the tap and resets the report.

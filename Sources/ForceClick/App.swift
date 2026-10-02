@@ -20,6 +20,7 @@ import SwiftUI
     var settingsWindow: NSWindow?
     var libraryWindow: NSWindow?
     var diagnosticsWindow: NSWindow?
+    var inputDiagnosticsWindow: NSWindow?
     private var outsideClickMonitor: Any?
     private var localClickMonitor: Any?
     private var captureTask: Task<Void, Never>?
@@ -50,6 +51,7 @@ import SwiftUI
         menu.addItem(item("Notes & todos…", #selector(openLibrary)))
         menu.addItem(item("Settings…", #selector(openSettings)))
         menu.addItem(item("Capture diagnostics…", #selector(openDiagnostics)))
+        menu.addItem(item("Input diagnostics & trackpad test…", #selector(openInputDiagnostics)))
         menu.addItem(.separator()); menu.addItem(item("Quit ForceClick", #selector(quit)))
         statusItem.menu = menu
         session.openAccessibilitySettings = { [weak self] in self?.openAccessibilityPermissionSettings() }
@@ -190,7 +192,7 @@ import SwiftUI
         panelShownAt = ProcessInfo.processInfo.systemUptime
     }
     @objc func openSettings() {
-        if settingsWindow == nil { settingsWindow = window(title: "ForceClick Settings", view: SettingsView(store: store, triggers: triggers, openCommand: { [weak self] in self?.openCommand() })) }
+        if settingsWindow == nil { settingsWindow = window(title: "ForceClick Settings", view: SettingsView(store: store, triggers: triggers, openCommand: { [weak self] in self?.openCommand() }, openInputDiagnostics: { [weak self] in self?.openInputDiagnostics() })) }
         NSApp.activate(ignoringOtherApps: true); settingsWindow?.makeKeyAndOrderFront(nil)
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -204,6 +206,14 @@ import SwiftUI
     @objc func openDiagnostics() {
         if diagnosticsWindow == nil { diagnosticsWindow = window(title: "ForceClick Capture Diagnostics", view: CaptureDiagnosticsView(diagnostics: .shared)) }
         NSApp.activate(ignoringOtherApps: true); diagnosticsWindow?.makeKeyAndOrderFront(nil)
+    }
+    @objc func openInputDiagnostics() {
+        if inputDiagnosticsWindow == nil {
+            inputDiagnosticsWindow = window(title: "ForceClick Input Diagnostics", view: PressureDiagnosticsView(diagnostics: .shared, restart: { [weak self] in
+                self?.triggers.stop(); self?.triggers.start()
+            }))
+        }
+        NSApp.activate(ignoringOtherApps: true); inputDiagnosticsWindow?.makeKeyAndOrderFront(nil)
     }
     func window<V: View>(title: String, view: V) -> NSWindow {
         let window = NSWindow(contentRect: .zero, styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)

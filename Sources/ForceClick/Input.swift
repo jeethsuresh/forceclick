@@ -323,12 +323,72 @@ struct PassiveLookUpSuppression: LookUpSuppression {
     func stop() {}
 }
 
+// AppKit's global monitor does not promise delivery of pressure/gesture
+// events. Observe the session stream directly and let public NSEvent
+// conversion identify pressure; do not guess private CGEvent type/field IDs.
+@MainActor final class PressureEventTap {
+    private var port: CFMachPort?
+    private var runLoopSource: CFRunLoopSource?
+    var onEvent: (NSEvent) -> Void = { _ in }
+    var onInterruption: () -> Void = {}
+    var isActive: Bool { port.map { CGEvent.tapIsEnabled(tap: $0) } ?? false }
+    static var eventMask: CGEventMask {
+        // Include gesture carriers without assuming their Quartz type equals
+        // the NSEvent type. Never subscribe to keyboard/modifier events.
+        let excluded: [CGEventType] = [.keyDown, .keyUp, .flagsChanged, .mouseMoved, .scrollWheel]
+        return excluded.reduce(CGEventMask.max) { $0 & ~(CGEventMask(1) << $1.rawValue) }
+    }
+    func start() {
+        stop()
+        let pointer = Unmanaged.passUnretained(self).toOpaque()
+        guard let port = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
+                                          options: .listenOnly, eventsOfInterest: Self.eventMask,
+                                          callback: { _, type, event, userInfo in
+            guard let userInfo else { return Unmanaged.passUnretained(event) }
+            // The source is installed only on the main run loop.
+            MainActor.assumeIsolated {
+                Unmanaged<PressureEventTap>.fromOpaque(userInfo).takeUnretainedValue().receive(type: type, event: event)
+            }
+            return Unmanaged.passUnretained(event)
+        }, userInfo: pointer) else {
+            PressureDiagnostics.shared.setTapStatus("Session event tap could not be installed; check macOS input access")
+            return
+        }
+        guard let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, port, 0) else {
+            CFMachPortInvalidate(port)
+            PressureDiagnostics.shared.setTapStatus("Could not create the event-tap run-loop source")
+            return
+        }
+        self.port = port; runLoopSource = source
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        CGEvent.tapEnable(tap: port, enable: true)
+        PressureDiagnostics.shared.setTapStatus(isActive ? "Session listen-only tap installed and enabled" : "Session tap installed but disabled")
+    }
+    private func receive(type: CGEventType, event: CGEvent) {
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            onInterruption() // Missing pressure samples cannot qualify as a continuous hold.
+            if let port { CGEvent.tapEnable(tap: port, enable: true) }
+            PressureDiagnostics.shared.setTapStatus("Session tap re-enabled after \(type == .tapDisabledByTimeout ? "timeout" : "system disable")")
+            return
+        }
+        let converted = NSEvent(cgEvent: event)
+        PressureDiagnostics.shared.quartzEvent(type: type, converted: converted)
+        if let converted { onEvent(converted) }
+    }
+    func stop() {
+        if let runLoopSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoopSource, .commonModes) }
+        if let port { CGEvent.tapEnable(tap: port, enable: false); CFMachPortInvalidate(port) }
+        port = nil; runLoopSource = nil
+    }
+}
+
 @MainActor final class TriggerCoordinator: ObservableObject {
     @Published var pressureEvents = 0
     @Published var shortcutStatus = "Starting…"
     @Published var pressureStatus = "Waiting for Force Click"
     private var global: Any?
     private var localRelease: Any?
+    private let pressureTap = PressureEventTap()
     private var hotKey: EventHotKeyRef?
     private var handler: EventHandlerRef?
     private var gate = PressureGate()
@@ -345,11 +405,24 @@ struct PassiveLookUpSuppression: LookUpSuppression {
     var trigger: (Bool, pid_t?, TimeInterval) -> Void = { _, _, _ in }
     let suppression: LookUpSuppression = PassiveLookUpSuppression()
     func start() {
+        PressureDiagnostics.shared.reset()
         suppression.start()
+        pressureTap.onEvent = { [weak self] event in self?.input(event) }
+        pressureTap.onInterruption = { [weak self] in
+            guard let self else { return }
+            self.releasePressure(at: self.clock())
+        }
+        pressureTap.start()
         let inputMask: NSEvent.EventTypeMask = [.pressure, .leftMouseDown, .leftMouseUp, .rightMouseDown, .otherMouseDown]
-        global = NSEvent.addGlobalMonitorForEvents(matching: inputMask) { [weak self] event in self?.input(event) }
-        localRelease = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseUp, .rightMouseDown, .otherMouseDown]) { [weak self] event in
-            self?.releasePressure(at: event.timestamp)
+        global = NSEvent.addGlobalMonitorForEvents(matching: inputMask) { [weak self] event in
+            PressureDiagnostics.shared.event(event, source: "AppKit global")
+            if self?.pressureTap.isActive == false { self?.input(event) }
+        }
+        localRelease = NSEvent.addLocalMonitorForEvents(matching: inputMask) { [weak self] event in
+            PressureDiagnostics.shared.event(event, source: "AppKit local")
+            if event.type == .leftMouseUp || event.type == .rightMouseDown || event.type == .otherMouseDown {
+                self?.releasePressure(at: event.timestamp)
+            }
             return event
         }
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
@@ -369,14 +442,16 @@ struct PassiveLookUpSuppression: LookUpSuppression {
         switch event.type {
         case .pressure:
             pressureEvents += 1
+            guard frontmostPID() != ProcessInfo.processInfo.processIdentifier else { return }
             receivePressure(stage: event.stage, at: event.timestamp, sourcePID: frontmostPID())
         case .leftMouseDown:
             if gate.mouseDown(at: event.timestamp) {
                 cancelHold(); gesturePID = nil
                 pressureStatus = "Ordinary click; waiting for a deep press"
             }
-        default:
+        case .leftMouseUp, .rightMouseDown, .otherMouseDown:
             releasePressure(at: event.timestamp)
+        default: break
         }
     }
     func receivePressure(stage: Int, at timestamp: TimeInterval, sourcePID: pid_t?) {
@@ -398,6 +473,7 @@ struct PassiveLookUpSuppression: LookUpSuppression {
         // Repeated stage-2 samples must not restart the hold timer. Steady
         // pressure may stop generating samples, so firing is timer-driven.
         guard armedDeadline != deadline else { return }
+        PressureDiagnostics.shared.note("Deep hold armed; waiting >0.5 seconds")
         scheduleHold(until: deadline)
     }
     func releasePressure(at timestamp: TimeInterval) {
@@ -423,12 +499,14 @@ struct PassiveLookUpSuppression: LookUpSuppression {
         holdTask = nil; armedDeadline = nil
         let now = clock()
         guard enabled(), let processID = gesturePID, frontmostPID() == processID else {
+            PressureDiagnostics.shared.note("Deep hold cancelled: detection disabled or source app lost focus")
             releasePressure(at: now)
             return
         }
         let began = gate.deepPressStartedAt
         if gate.fireIfReady(at: now, mouseIsDown: mouseIsDown()), let began {
             pressureStatus = "Opened once for this Force Click hold"
+            PressureDiagnostics.shared.note("Deep hold accepted; opening command panel")
             trigger(true, processID, began)
         } else if let deadline = gate.deadline {
             scheduleHold(until: deadline)
@@ -439,6 +517,7 @@ struct PassiveLookUpSuppression: LookUpSuppression {
     }
     func stop() {
         cancelHold(); gesturePID = nil
+        pressureTap.stop()
         if let global { NSEvent.removeMonitor(global) }
         if let localRelease { NSEvent.removeMonitor(localRelease) }
         if let hotKey { UnregisterEventHotKey(hotKey) }

@@ -43,3 +43,66 @@ import Security
         try? report.write(to: url, atomically: true, encoding: .utf8)
     }
 }
+
+// Input diagnostics contain event types/stages and counts, never key codes,
+// pointer positions, selected text, or document contents. Disk writes are
+// debounced so the event-tap callback never performs file I/O.
+@MainActor final class PressureDiagnostics: ObservableObject {
+    static let shared = PressureDiagnostics()
+    @Published private(set) var report = "Input monitoring has not started."
+    private var counts: [String: Int] = [:]
+    private var lines: [String] = []
+    private var lastStages: [String: Int] = [:]
+    private var publishTask: Task<Void, Never>?
+    private var startedAt = ProcessInfo.processInfo.systemUptime
+    private var tapStatus = "Not installed"
+    let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("ForceClick/pressure-diagnostics.txt")
+
+    func reset() {
+        publishTask?.cancel(); publishTask = nil
+        counts = [:]; lines = []; lastStages = [:]
+        startedAt = ProcessInfo.processInfo.systemUptime
+        note("Input monitors starting")
+    }
+    func setTapStatus(_ status: String) {
+        tapStatus = status
+        note(status)
+    }
+    func note(_ line: String) {
+        lines.append(String(format: "%.3fs · %@", ProcessInfo.processInfo.systemUptime - startedAt, line))
+        lines = Array(lines.suffix(60))
+        schedulePublish()
+    }
+    func event(_ event: NSEvent, source: String) {
+        counts["\(source) NSEvent \(event.type.rawValue)", default: 0] += 1
+        if event.type == .pressure, lastStages[source] != event.stage {
+            lastStages[source] = event.stage
+            note("\(source): stage \(event.stage), pressure \(String(format: "%.3f", event.pressure)), behavior \(event.pressureBehavior.rawValue)")
+        }
+        schedulePublish()
+    }
+    func quartzEvent(type: CGEventType, converted: NSEvent?) {
+        counts["Quartz raw type \(type.rawValue)", default: 0] += 1
+        if let converted { event(converted, source: "Quartz") }
+        else { counts["Quartz conversion unavailable", default: 0] += 1; schedulePublish() }
+    }
+    private func schedulePublish() {
+        guard publishTask == nil else { return }
+        publishTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: 200_000_000) } catch { return }
+            guard let self else { return }
+            self.publishTask = nil
+            let build = Bundle.main.object(forInfoDictionaryKey: "ForceClickBuild") as? String ?? "development"
+            let header = ["ForceClick build: \(build)", "Process: \(ProcessInfo.processInfo.processIdentifier)",
+                          "Accessibility trusted: \(AXIsProcessTrusted())", "Listen access: \(CGPreflightListenEventAccess())",
+                          "Tap: \(self.tapStatus)", "Pressure NSEvent type: \(NSEvent.EventType.pressure.rawValue)"]
+            self.report = (header + self.counts.keys.sorted().map { "\($0): \(self.counts[$0]!)" } + ["", "Recent input transitions:"] + self.lines).joined(separator: "\n")
+            let report = self.report, url = self.url
+            Task.detached(priority: .utility) {
+                try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try? report.write(to: url, atomically: true, encoding: .utf8)
+            }
+        }
+    }
+}
